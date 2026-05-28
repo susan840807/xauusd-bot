@@ -1,5 +1,3 @@
-
- 
 import requests
 import yfinance as yf
 from datetime import datetime, timezone, timedelta
@@ -29,39 +27,66 @@ def is_high_flow():
 
 # ── FETCH REAL PRICE DATA ─────────────────────────────────────
 def fetch_real_prices():
-    try:
-        ticker = yf.Ticker("GC=F")
-        df = ticker.history(period="1d", interval="15m")
+    # Try multiple tickers to get correct ~$4400+ gold price
+    tickers = ["XAUUSD=X", "GC=F", "IAU", "GLD"]
 
-        if df.empty:
-            raise Exception("Empty dataframe")
-
-        prices  = [round(float(x), 2) for x in df["Close"].dropna().tolist()]
-        volumes = [int(x) for x in df["Volume"].fillna(0).tolist()]
-
-        print(f"📊 Fetched {len(prices)} real 15m candles via yfinance")
-        print(f"💰 Latest XAUUSD: ${prices[-1]}")
-        return prices, volumes
-
-    except Exception as e:
-        print(f"⚠ yfinance error: {e}")
-        # Fallback
+    for symbol in tickers:
         try:
-            r = requests.get(
-                "https://query1.finance.yahoo.com/v8/finance/chart/GC=F",
-                params={"interval": "15m", "range": "1d"},
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=15
-            )
-            data = r.json()
-            result = data["chart"]["result"][0]
-            closes  = [round(float(c), 2) for c in result["indicators"]["quote"][0]["close"] if c]
-            volumes = [int(v) if v else 0   for v in result["indicators"]["quote"][0]["volume"] if v is not None]
-            print(f"📊 Fallback: {len(closes)} candles | Latest: ${closes[-1]}")
-            return closes, volumes
-        except Exception as e2:
-            print(f"❌ All price sources failed: {e2}")
-            return None, None
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period="2d", interval="15m")
+
+            if df.empty:
+                print(f"⚠ {symbol}: empty data")
+                continue
+
+            prices  = [round(float(x), 2) for x in df["Close"].dropna().tolist()]
+            volumes = [int(x) for x in df["Volume"].fillna(0).tolist()]
+
+            if not prices:
+                continue
+
+            last = prices[-1]
+            print(f"📊 {symbol}: ${last} ({len(prices)} candles)")
+
+            # XAUUSD should be ~3000-5000, GLD ~300-500, IAU ~30-50
+            if symbol in ["XAUUSD=X", "GC=F"] and last > 2000:
+                print(f"✅ Using {symbol}: ${last}")
+                return prices, volumes, symbol
+            elif symbol == "GLD" and last > 200:
+                # GLD = gold price / 10 approx
+                prices = [round(p * 10, 2) for p in prices]
+                print(f"✅ Using GLD (x10): ${prices[-1]}")
+                return prices, volumes, symbol
+            elif symbol == "IAU" and last > 20:
+                # IAU = gold price / 100 approx
+                prices = [round(p * 100, 2) for p in prices]
+                print(f"✅ Using IAU (x100): ${prices[-1]}")
+                return prices, volumes, symbol
+
+        except Exception as e:
+            print(f"⚠ {symbol} error: {e}")
+            continue
+
+    # Last resort: fetch spot price from API
+    try:
+        r = requests.get(
+            "https://query2.finance.yahoo.com/v8/finance/chart/XAUUSD=X",
+            params={"interval": "15m", "range": "2d"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=15
+        )
+        data = r.json()
+        result = data["chart"]["result"][0]
+        closes  = [round(float(c), 2) for c in result["indicators"]["quote"][0]["close"] if c]
+        volumes = [int(v) if v else 0 for v in result["indicators"]["quote"][0]["volume"] if v is not None]
+        if closes:
+            print(f"✅ Fallback XAUUSD=X API: ${closes[-1]}")
+            return closes, volumes, "XAUUSD=X"
+    except Exception as e:
+        print(f"⚠ API fallback failed: {e}")
+
+    print("❌ All sources failed")
+    return None, None, None
 
 # ── INDICATORS ────────────────────────────────────────────────
 def calc_rsi(prices, period=14):
@@ -113,10 +138,10 @@ def quality_gate(prices, volumes):
     macd  = calc_macd(prices)
     rng   = round(max(prices[-20:]) - min(prices[-20:]), 2) if len(prices) >= 20 else round(max(prices) - min(prices), 2)
 
-    vol_spike, vol_ratio   = detect_volume_spike(volumes)
-    momentum,  move_size   = detect_momentum(prices)
-    structure              = abs(ma20 - ma50) > 2.0
-    trend                  = "bullish" if ma20 > ma50 else "bearish"
+    vol_spike, vol_ratio = detect_volume_spike(volumes)
+    momentum,  move_size = detect_momentum(prices)
+    structure            = abs(ma20 - ma50) > 2.0
+    trend                = "bullish" if ma20 > ma50 else "bearish"
 
     checks = {
         "high_flow":       is_high_flow(),
@@ -209,15 +234,16 @@ def main():
     myt = get_myt()
     print(f"🔍 Scan: {myt.strftime('%H:%M MYT')} | Session: {get_session().upper()}")
 
-    prices, volumes = fetch_real_prices()
+    prices, volumes, source = fetch_real_prices()
 
     if not prices or len(prices) < 5:
         print("❌ Not enough price data")
         return
 
+    print(f"💰 XAUUSD: ${prices[-1]} (source: {source}) | Candles: {len(prices)}")
+
     gate = quality_gate(prices, volumes)
     print(f"✅ Gates: {gate['passed']}/6 | RSI: {gate['rsi']} | Range: ${gate['range']} | Vol: {gate['vol_ratio']}x")
-    print(f"   Session:{gate['high_flow']} | PipPot:{gate['pip_potential']} | Structure:{gate['clear_structure']} | VolSpike:{gate['volume_spike']} | RSI/MACD:{gate['ind_aligned']}")
 
     if gate["all_pass"]:
         direction = get_direction(prices, gate)
@@ -239,3 +265,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+ 
+
