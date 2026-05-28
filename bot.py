@@ -1,6 +1,6 @@
 import requests
 import sys
-import random
+import json
 from datetime import datetime, timezone, timedelta
 import os
 
@@ -26,32 +26,52 @@ def get_session():
 def is_high_flow():
     return get_session() in ["london", "ny", "overlap"]
 
-# ── FETCH PRICE ───────────────────────────────────────────────
-def fetch_gold_price():
-    # Try metals.live (free, no key needed)
+# ── FETCH REAL PRICE DATA FROM YAHOO FINANCE ─────────────────
+def fetch_real_prices():
+    """Fetch last 60 x 15min candles of XAUUSD from Yahoo Finance"""
     try:
-        r = requests.get("https://api.metals.live/v1/spot/gold", timeout=10)
-        return float(r.json()[0]["price"])
-    except:
-        pass
-    # Try frankfurter (XAU)
-    try:
-        r = requests.get("https://api.frankfurter.app/latest?from=XAU&to=USD", timeout=10)
-        return float(r.json()["rates"]["USD"])
-    except:
-        pass
-    # Fallback simulated
-    return round(2384.50 + (random.random() - 0.5) * 10, 2)
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
+        params = {
+            "interval": "15m",
+            "range": "1d",
+            "includePrePost": "false"
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        data = r.json()
 
-# ── GENERATE FAKE HISTORY for analysis ────────────────────────
-def build_price_history(current_price):
-    prices = []
-    p = current_price - 15
-    for _ in range(60):
-        p = p + (random.random() - 0.49) * 2.0
-        prices.append(round(p, 2))
-    prices.append(current_price)
-    return prices
+        result = data["chart"]["result"][0]
+        closes = result["indicators"]["quote"][0]["close"]
+        volumes = result["indicators"]["quote"][0]["volume"]
+        timestamps = result["timestamp"]
+
+        # Clean None values
+        prices = []
+        vols = []
+        times = []
+        for i, (c, v, t) in enumerate(zip(closes, volumes, timestamps)):
+            if c is not None and v is not None:
+                prices.append(round(float(c), 2))
+                vols.append(int(v) if v else 0)
+                times.append(t)
+
+        print(f"📊 Fetched {len(prices)} real candles from Yahoo Finance")
+        print(f"💰 Latest XAUUSD: ${prices[-1]}")
+        return prices, vols, times
+
+    except Exception as e:
+        print(f"⚠ Yahoo Finance error: {e}")
+        # Fallback to metals.live
+        try:
+            r = requests.get("https://api.metals.live/v1/spot/gold", timeout=10)
+            price = float(r.json()[0]["price"])
+            print(f"💰 Fallback price from metals.live: ${price}")
+            return [price], [0], [0]
+        except:
+            print("❌ All price sources failed")
+            return None, None, None
 
 # ── INDICATORS ────────────────────────────────────────────────
 def calc_rsi(prices, period=14):
@@ -68,31 +88,108 @@ def calc_rsi(prices, period=14):
 def calc_ma(prices, n):
     if len(prices) < n:
         return prices[-1]
-    return sum(prices[-n:]) / n
+    return round(sum(prices[-n:]) / n, 2)
 
-def volume_spike(prices):
-    if len(prices) < 6:
-        return False
-    return abs(prices[-1] - prices[-5]) > 3.0
+def calc_macd(prices):
+    if len(prices) < 26:
+        return 0, 0
+    def ema(p, n):
+        k = 2 / (n + 1)
+        e = p[-n]
+        for x in p[-n+1:]:
+            e = x * k + e * (1 - k)
+        return e
+    macd_line = ema(prices, 12) - ema(prices, 26)
+    return round(macd_line, 4)
+
+def detect_real_volume_spike(volumes):
+    """Detect real volume spike using actual market volume"""
+    if len(volumes) < 10:
+        return False, 0, 0
+    recent_vol = volumes[-1]
+    avg_vol = sum(volumes[-10:-1]) / 9
+    if avg_vol == 0:
+        return False, 0, 0
+    ratio = recent_vol / avg_vol
+    is_spike = ratio >= 1.5  # 50% above average = spike
+    return is_spike, round(ratio, 2), int(avg_vol)
+
+def detect_price_momentum(prices):
+    """Detect strong price momentum in last 4 candles"""
+    if len(prices) < 5:
+        return False, 0
+    move = abs(prices[-1] - prices[-5])
+    return move >= 5.0, round(move, 2)  # $5 = ~50 pips move in 1 hour
+
+def detect_structure(prices):
+    """Check for clear trend structure"""
+    ma20 = calc_ma(prices, 20)
+    ma50 = calc_ma(prices, 50)
+    divergence = abs(ma20 - ma50)
+    is_clear = divergence > 2.0
+    trend = "bullish" if ma20 > ma50 else "bearish"
+    return is_clear, trend, ma20, ma50
 
 # ── QUALITY GATE ─────────────────────────────────────────────
-def quality_gate(prices):
+def quality_gate(prices, volumes):
+    rsi   = calc_rsi(prices)
+    macd  = calc_macd(prices)
     ma20  = calc_ma(prices, 20)
     ma50  = calc_ma(prices, 50)
-    rsi   = calc_rsi(prices)
-    rng   = max(prices[-20:]) - min(prices[-20:])
+    price_range = max(prices[-20:]) - min(prices[-20:]) if len(prices) >= 20 else max(prices) - min(prices)
+
+    vol_spike, vol_ratio, avg_vol = detect_real_volume_spike(volumes)
+    momentum, move_size          = detect_price_momentum(prices)
+    structure, trend, _, _       = detect_structure(prices)
 
     checks = {
         "high_flow":      is_high_flow(),
-        "pip_potential":  rng >= 10.0,
-        "clear_structure": abs(ma20 - ma50) > 1.5,
-        "volume_spike":   volume_spike(prices),
-        "ind_aligned":    rsi < 45 or rsi > 55,
-        "limit_ok":       True,   # GitHub Actions runs fresh each time
+        "pip_potential":  price_range >= 10.0,
+        "clear_structure": structure,
+        "volume_spike":   vol_spike or momentum,  # real volume OR strong momentum
+        "ind_aligned":    (rsi < 42 or rsi > 58) and macd != 0,
+        "limit_ok":       True,
     }
+
     passed = sum(checks.values())
-    return {**checks, "passed": passed, "all_pass": passed == 6,
-            "rsi": rsi, "ma20": round(ma20,2), "ma50": round(ma50,2), "range": round(rng,2)}
+    return {
+        **checks,
+        "passed": passed,
+        "all_pass": passed == 6,
+        "rsi": rsi,
+        "macd": macd,
+        "ma20": ma20,
+        "ma50": ma50,
+        "range": round(price_range, 2),
+        "vol_ratio": vol_ratio,
+        "move_size": move_size,
+        "trend": trend,
+    }
+
+# ── DETERMINE DIRECTION ───────────────────────────────────────
+def get_direction(prices, gate):
+    last  = prices[-1]
+    ma20  = gate["ma20"]
+    ma50  = gate["ma50"]
+    rsi   = gate["rsi"]
+    macd  = gate["macd"]
+
+    bull = 0
+    bear = 0
+
+    if last > ma20: bull += 1
+    else: bear += 1
+
+    if ma20 > ma50: bull += 1
+    else: bear += 1
+
+    if rsi < 50: bull += 1
+    else: bear += 1
+
+    if macd > 0: bull += 1
+    else: bear += 1
+
+    return "BUY" if bull >= 3 else "SELL"
 
 # ── TELEGRAM ─────────────────────────────────────────────────
 def send_telegram(msg):
@@ -105,30 +202,40 @@ def send_telegram(msg):
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
             timeout=10
         )
-        return r.json().get("ok", False)
+        ok = r.json().get("ok", False)
+        return ok
     except Exception as e:
         print(f"Telegram error: {e}")
         return False
 
 # ── BUILD MESSAGE ─────────────────────────────────────────────
 def build_message(direction, price, gate, session):
-    myt     = get_myt()
-    is_buy  = direction == "BUY"
-    emoji   = "🟢" if is_buy else "🔴"
-    sl      = round(price - 10 if is_buy else price + 10, 2)
-    tp1     = round(price + 10 if is_buy else price - 10, 2)
-    tp2     = round(price + 20 if is_buy else price - 20, 2)
-    tp3     = round(price + 30 if is_buy else price - 30, 2)
-    conf    = min(95, 50 + gate["passed"] * 7)
+    myt    = get_myt()
+    is_buy = direction == "BUY"
+    emoji  = "🟢" if is_buy else "🔴"
+    sl     = round(price - 10 if is_buy else price + 10, 2)
+    tp1    = round(price + 10 if is_buy else price - 10, 2)
+    tp2    = round(price + 20 if is_buy else price - 20, 2)
+    tp3    = round(price + 30 if is_buy else price - 30, 2)
+    conf   = min(95, 50 + gate["passed"] * 7)
 
     reasons = []
-    if gate["high_flow"]:       reasons.append(f"{session.upper()} session — high liquidity")
-    if gate["volume_spike"]:    reasons.append("Volume spike detected")
+    if gate["high_flow"]:
+        reasons.append(f"{session.upper()} session — high liquidity active")
+    if gate["vol_ratio"] >= 1.5:
+        reasons.append(f"Real volume spike detected ({gate['vol_ratio']}x average)")
+    elif gate["move_size"] >= 5:
+        reasons.append(f"Strong price momentum (${gate['move_size']} move)")
     if gate["clear_structure"]:
-        trend = "bullish" if gate["ma20"] > gate["ma50"] else "bearish"
-        reasons.append(f"MA20/MA50 {trend} divergence")
-    if gate["rsi"] < 45:        reasons.append(f"RSI oversold ({gate['rsi']}) — bounce likely")
-    elif gate["rsi"] > 55:      reasons.append(f"RSI overbought ({gate['rsi']}) — rejection likely")
+        reasons.append(f"MA20/MA50 {gate['trend']} structure confirmed")
+    if gate["rsi"] < 42:
+        reasons.append(f"RSI oversold ({gate['rsi']}) — bounce likely")
+    elif gate["rsi"] > 58:
+        reasons.append(f"RSI overbought ({gate['rsi']}) — rejection likely")
+    if gate["macd"] > 0:
+        reasons.append("MACD bullish momentum")
+    else:
+        reasons.append("MACD bearish momentum")
 
     return (
         f"{emoji} XAUUSD {direction} SIGNAL\n\n"
@@ -138,7 +245,7 @@ def build_message(direction, price, gate, session):
         f"✅ TP1:       ${tp1} (+100 pips)\n"
         f"✅ TP2:       ${tp2} (+200 pips)\n"
         f"✅ TP3:       ${tp3} (+300 pips)\n\n"
-        f"📊 Target: ~100–200 pips\n"
+        f"📊 Daily Range: ${gate['range']} (~{int(gate['range']*10)} pips)\n"
         f"💯 Confidence: {conf}% ({gate['passed']}/6 gates)\n\n"
         f"🔍 Analysis:\n"
         + "\n".join(f"· {r}" for r in reasons)
@@ -148,22 +255,30 @@ def build_message(direction, price, gate, session):
 # ── MAIN ─────────────────────────────────────────────────────
 def main():
     myt = get_myt()
-    print(f"🔍 Scan started: {myt.strftime('%H:%M MYT')} | Session: {get_session().upper()}")
+    print(f"🔍 Scan: {myt.strftime('%H:%M MYT')} | Session: {get_session().upper()}")
 
-    price = fetch_gold_price()
-    print(f"💰 XAUUSD: ${price}")
+    # Fetch real price data
+    prices, volumes, times = fetch_real_prices()
 
-    prices = build_price_history(price)
-    gate   = quality_gate(prices)
+    if not prices or len(prices) < 5:
+        print("❌ Not enough price data")
+        return
 
-    print(f"✅ Gates passed: {gate['passed']}/6 | RSI: {gate['rsi']} | Range: ${gate['range']}")
+    print(f"💰 XAUUSD: ${prices[-1]} | Candles: {len(prices)}")
+
+    # Run quality gate
+    gate = quality_gate(prices, volumes)
+
+    print(f"✅ Gates: {gate['passed']}/6 | RSI: {gate['rsi']} | Range: ${gate['range']} | Vol ratio: {gate['vol_ratio']}x")
+    print(f"   High flow: {gate['high_flow']} | Vol spike: {gate['volume_spike']} | Structure: {gate['clear_structure']} | RSI/MACD: {gate['ind_aligned']}")
 
     if gate["all_pass"]:
-        is_buy    = price > gate["ma20"] and gate["rsi"] < 55
-        direction = "BUY" if is_buy else "SELL"
+        direction = get_direction(prices, gate)
         session   = get_session()
+        price     = prices[-1]
         msg       = build_message(direction, price, gate, session)
-        print(f"🚨 SIGNAL: {direction} @ ${price}")
+
+        print(f"\n🚨 SIGNAL: {direction} XAUUSD @ ${price}")
         if send_telegram(msg):
             print("📲 Telegram sent successfully!")
         else:
@@ -171,11 +286,13 @@ def main():
     else:
         reasons = []
         if not gate["high_flow"]:       reasons.append("Not London/NY session")
-        if not gate["pip_potential"]:   reasons.append("Range too narrow")
-        if not gate["clear_structure"]: reasons.append("No clear structure")
-        if not gate["volume_spike"]:    reasons.append("No volume spike")
-        if not gate["ind_aligned"]:     reasons.append("RSI/MACD neutral")
+        if not gate["pip_potential"]:   reasons.append(f"Range too narrow (${gate['range']})")
+        if not gate["clear_structure"]: reasons.append("No clear MA structure")
+        if not gate["volume_spike"]:    reasons.append(f"No volume spike (ratio: {gate['vol_ratio']}x)")
+        if not gate["ind_aligned"]:     reasons.append(f"RSI neutral ({gate['rsi']})")
         print(f"⛔ No signal: {', '.join(reasons)}")
 
 if __name__ == "__main__":
     main()
+
+ 
