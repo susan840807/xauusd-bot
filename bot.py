@@ -1,11 +1,11 @@
 import requests
-import yfinance as yf
 from datetime import datetime, timezone, timedelta
 import os
 
 # ── CONFIG ───────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TWELVEDATA_KEY   = os.environ.get("TWELVEDATA_KEY", "")
 MAX_SIGNALS_PER_DAY = 3
 
 # ── TIME ─────────────────────────────────────────────────────
@@ -25,68 +25,37 @@ def get_session():
 def is_high_flow():
     return get_session() in ["london", "ny", "overlap"]
 
-# ── FETCH REAL PRICE DATA ─────────────────────────────────────
+# ── FETCH REAL XAUUSD FROM TWELVEDATA ────────────────────────
 def fetch_real_prices():
-    # Try multiple tickers to get correct ~$4400+ gold price
-    tickers = ["XAUUSD=X", "GC=F", "IAU", "GLD"]
-
-    for symbol in tickers:
-        try:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period="2d", interval="15m")
-
-            if df.empty:
-                print(f"⚠ {symbol}: empty data")
-                continue
-
-            prices  = [round(float(x), 2) for x in df["Close"].dropna().tolist()]
-            volumes = [int(x) for x in df["Volume"].fillna(0).tolist()]
-
-            if not prices:
-                continue
-
-            last = prices[-1]
-            print(f"📊 {symbol}: ${last} ({len(prices)} candles)")
-
-            # XAUUSD should be ~3000-5000, GLD ~300-500, IAU ~30-50
-            if symbol in ["XAUUSD=X", "GC=F"] and last > 2000:
-                print(f"✅ Using {symbol}: ${last}")
-                return prices, volumes, symbol
-            elif symbol == "GLD" and last > 200:
-                # GLD = gold price / 10 approx
-                prices = [round(p * 10, 2) for p in prices]
-                print(f"✅ Using GLD (x10): ${prices[-1]}")
-                return prices, volumes, symbol
-            elif symbol == "IAU" and last > 20:
-                # IAU = gold price / 100 approx
-                prices = [round(p * 100, 2) for p in prices]
-                print(f"✅ Using IAU (x100): ${prices[-1]}")
-                return prices, volumes, symbol
-
-        except Exception as e:
-            print(f"⚠ {symbol} error: {e}")
-            continue
-
-    # Last resort: fetch spot price from API
     try:
-        r = requests.get(
-            "https://query2.finance.yahoo.com/v8/finance/chart/XAUUSD=X",
-            params={"interval": "15m", "range": "2d"},
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-            timeout=15
-        )
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol":    "XAU/USD",
+            "interval":  "15min",
+            "outputsize": 60,
+            "apikey":    TWELVEDATA_KEY,
+        }
+        r = requests.get(url, params=params, timeout=15)
         data = r.json()
-        result = data["chart"]["result"][0]
-        closes  = [round(float(c), 2) for c in result["indicators"]["quote"][0]["close"] if c]
-        volumes = [int(v) if v else 0 for v in result["indicators"]["quote"][0]["volume"] if v is not None]
-        if closes:
-            print(f"✅ Fallback XAUUSD=X API: ${closes[-1]}")
-            return closes, volumes, "XAUUSD=X"
-    except Exception as e:
-        print(f"⚠ API fallback failed: {e}")
 
-    print("❌ All sources failed")
-    return None, None, None
+        if data.get("status") == "error":
+            print(f"⚠ Twelvedata error: {data.get('message')}")
+            return None, None
+
+        candles = data["values"]
+        # Values are newest first, reverse to oldest first
+        candles = list(reversed(candles))
+
+        prices  = [round(float(c["close"]), 2) for c in candles]
+        volumes = [int(float(c.get("volume", 0))) for c in candles]
+
+        print(f"📊 Fetched {len(prices)} real 15m candles from Twelvedata")
+        print(f"💰 Latest XAU/USD: ${prices[-1]}")
+        return prices, volumes
+
+    except Exception as e:
+        print(f"❌ Twelvedata fetch failed: {e}")
+        return None, None
 
 # ── INDICATORS ────────────────────────────────────────────────
 def calc_rsi(prices, period=14):
@@ -117,7 +86,7 @@ def calc_macd(prices):
     return round(ema(prices, 12) - ema(prices, 26), 4)
 
 def detect_volume_spike(volumes):
-    if len(volumes) < 10:
+    if len(volumes) < 10 or sum(volumes) == 0:
         return False, 0
     recent = volumes[-1]
     avg    = sum(volumes[-10:-1]) / 9 if sum(volumes[-10:-1]) > 0 else 1
@@ -208,7 +177,7 @@ def build_message(direction, price, gate, session):
     elif gate["move_size"] >= 5:
         reasons.append(f"Strong momentum — ${gate['move_size']} move detected")
     if gate["clear_structure"]:
-        reasons.append(f"MA structure {gate['trend']} (MA20:{gate['ma20']} / MA50:{gate['ma50']})")
+        reasons.append(f"MA {gate['trend']} (MA20:{gate['ma20']} / MA50:{gate['ma50']})")
     if gate["rsi"] < 42:
         reasons.append(f"RSI oversold ({gate['rsi']}) — bounce likely")
     elif gate["rsi"] > 58:
@@ -234,22 +203,23 @@ def main():
     myt = get_myt()
     print(f"🔍 Scan: {myt.strftime('%H:%M MYT')} | Session: {get_session().upper()}")
 
-    prices, volumes, source = fetch_real_prices()
+    prices, volumes = fetch_real_prices()
 
     if not prices or len(prices) < 5:
         print("❌ Not enough price data")
         return
 
-    print(f"💰 XAUUSD: ${prices[-1]} (source: {source}) | Candles: {len(prices)}")
+    print(f"💰 XAU/USD: ${prices[-1]} | Candles: {len(prices)}")
 
     gate = quality_gate(prices, volumes)
     print(f"✅ Gates: {gate['passed']}/6 | RSI: {gate['rsi']} | Range: ${gate['range']} | Vol: {gate['vol_ratio']}x")
+    print(f"   HighFlow:{gate['high_flow']} | PipPot:{gate['pip_potential']} | Structure:{gate['clear_structure']} | VolSpike:{gate['volume_spike']} | Indicators:{gate['ind_aligned']}")
 
     if gate["all_pass"]:
         direction = get_direction(prices, gate)
         price     = prices[-1]
         msg       = build_message(direction, price, gate, get_session())
-        print(f"\n🚨 SIGNAL: {direction} XAUUSD @ ${price}")
+        print(f"\n🚨 SIGNAL: {direction} XAU/USD @ ${price}")
         if send_telegram(msg):
             print("📲 Telegram sent successfully!")
         else:
@@ -265,6 +235,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
- 
-
